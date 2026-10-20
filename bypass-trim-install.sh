@@ -12,7 +12,7 @@ OVERRIDE_DIR="/etc/systemd/system/fstrim.service.d"
 # Uninstall Function
 do_uninstall() {
     echo "=========================================="
-    echo "       TRIM BYPASS UNINSTALLATION         "
+    echo "        TRIM BYPASS UNINSTALLATION        "
     echo "=========================================="
     
     # 1. Remove systemd fstrim override
@@ -41,7 +41,7 @@ do_uninstall() {
 echo "=========================================="
 echo "    Bypass TRIM SSD - Installer / Manager "
 echo "=========================================="
-echo "1) Install / Re-install (Select new disk)"
+echo "1) Install / Re-install (Select Mount Point)"
 echo "2) Uninstall (Restore to default)"
 echo "3) Exit"
 echo "=========================================="
@@ -72,49 +72,75 @@ if [ -f "$TARGET_SCRIPT" ] || [ -d "$OVERRIDE_DIR" ]; then
 fi
 
 echo ""
-echo "=========================================="
-echo "          AVAILABLE DISK DRIVES           "
-echo "=========================================="
-lsblk -d -o NAME,SIZE,MODEL,ROTA,TRAN | grep -v "loop"
-echo "=========================================="
+echo "=========================================================================================="
+echo "                                AVAILABLE STORAGE DRIVES                                  "
+echo "=========================================================================================="
 
-# Prompt for target drive
-read -p "Enter target drive name (e.g., sda, sdb): " TARGET_DRIVE
+# Retrieve active mount point list (excluding boot, root, and virtual filesystems)
+mapfile -t MOUNT_LIST < <(lsblk -ln -o MOUNTPOINTS | grep -E '^/' | grep -v -E '^/($|boot|boot/|sys|dev|run|proc)')
 
-# Validate target block device
-if [ ! -b "/dev/$TARGET_DRIVE" ]; then
-    echo "[-] Error: Device /dev/$TARGET_DRIVE not found!"
+if [ ${#MOUNT_LIST[@]} -eq 0 ]; then
+    echo "[-] No active user mount points found! Mount your SSD first."
     exit 1
 fi
 
-# Auto-detect mountpoint if already mounted
-DETECTED_MOUNT=$(lsblk -no MOUNTPOINTS "/dev/$TARGET_DRIVE" | grep -v '^$' | head -n 1)
-if [ -n "$DETECTED_MOUNT" ]; then
-    read -p "Enter SSD mountpoint [Default: $DETECTED_MOUNT]: " TARGET_MOUNT
-    TARGET_MOUNT=${TARGET_MOUNT:-$DETECTED_MOUNT}
-else
-    read -p "Enter SSD mountpoint (e.g., /media/ssd): " TARGET_MOUNT
-fi
+# Print Table Header with clean left-aligned column formatting
+printf "%-4s %-8s %-8s %-35s %-20s\n" "NUM" "DEV" "SIZE" "MODEL" "MOUNT POINT"
+echo "------------------------------------------------------------------------------------------"
 
-if [ -z "$TARGET_MOUNT" ]; then
-    echo "[-] Error: Mountpoint cannot be empty!"
+# Display device data into table rows
+for i in "${!MOUNT_LIST[@]}"; do
+    # Find the partition name and its parent disk
+    PART_DEV=$(df "${MOUNT_LIST[$i]}" | tail -1 | awk '{print $1}' | sed 's|/dev/||')
+    PARENT_DEV=$(lsblk -no PKNAME "/dev/$PART_DEV" 2>/dev/null | xargs)
+    [ -z "$PARENT_DEV" ] && PARENT_DEV=$(lsblk -no PKNAME "$(lsblk -lno PKNAME,MOUNTPOINTS | grep "${MOUNT_LIST[$i]}" | awk '{print $1}')" 2>/dev/null | xargs)
+    
+    # Retrieve size and model info EXCLUSIVELY from the parent disk specifically (-d / --nodeps)
+    SIZE_INFO=$(lsblk -dno SIZE "/dev/$PARENT_DEV" 2>/dev/null | xargs)
+    MODEL_INFO=$(lsblk -dno MODEL "/dev/$PARENT_DEV" 2>/dev/null | xargs)
+    
+    # If model name is empty, fill with default text
+    [ -z "$MODEL_INFO" ] && MODEL_INFO="Generic Disk"
+
+    # Print data row aligned with header columns without text duplication
+    printf "%-4s %-8s %-8s %-35s %-20s\n" "$((i+1))" "$PARENT_DEV" "$SIZE_INFO" "${MODEL_INFO:0:33}" "${MOUNT_LIST[$i]}"
+done
+echo "=========================================================================================="
+
+# Number-based selection prompt
+read -p "Select target drive number [1-${#MOUNT_LIST[@]}]: " MOUNT_NUM
+
+# Validate numeric input
+if ! [[ "$MOUNT_NUM" =~ ^[0-9]+$ ]] || [ "$MOUNT_NUM" -lt 1 ] || [ "$MOUNT_NUM" -gt "${#MOUNT_LIST[@]}" ]; then
+    echo "[-] Error: Invalid number selection!"
     exit 1
 fi
+
+TARGET_MOUNT="${MOUNT_LIST[$((MOUNT_NUM-1))]}"
 
 echo ""
-echo "[1/4] Generating $TARGET_SCRIPT for drive /dev/$TARGET_DRIVE (mount: $TARGET_MOUNT)..."
-cat << EOF > "$TARGET_SCRIPT"
+echo "[1/4] Generating $TARGET_SCRIPT for mount point: $TARGET_MOUNT..."
+cat << 'EOF' > "$TARGET_SCRIPT"
 #!/bin/bash
-# Force provisioning_mode to unmap for drive $TARGET_DRIVE
-if [ -d "/sys/block/$TARGET_DRIVE/device/scsi_disk" ]; then
-    echo "unmap" | tee /sys/block/$TARGET_DRIVE/device/scsi_disk/*/provisioning_mode > /dev/null
+TARGET_MOUNT="REPLACE_WITH_MOUNT"
+
+# 1. Dynamically detect device name (sda/sdb) based on the mount point
+SSD_NAME=$(lsblk -no PKNAME "$(df "$TARGET_MOUNT" | tail -1 | awk '{print $1}')" 2>/dev/null || lsblk -no NAME -d | grep -E "$(lsblk -no PKNAME "$TARGET_MOUNT" 2>/dev/null)" | head -n1)
+[ -z "$SSD_NAME" ] && SSD_NAME=$(lsblk -lno PKNAME,MOUNTPOINTS | grep "$TARGET_MOUNT" | awk '{print $1}')
+
+# 2. Run bypass provisioning mode if the /sys path exists
+if [ -n "$SSD_NAME" ] && [ -d "/sys/block/$SSD_NAME/device/scsi_disk" ]; then
+    echo "unmap" | tee /sys/block/$SSD_NAME/device/scsi_disk/*/provisioning_mode > /dev/null
 fi
 
-# Execute TRIM
+# 3. Execute TRIM on the target mount point
 fstrim -v "$TARGET_MOUNT"
 
-echo "Done! TRIM successfully bypassed for /dev/$TARGET_DRIVE at $TARGET_MOUNT."
+echo "Done! TRIM successfully bypassed for /dev/${SSD_NAME:-unknown} at $TARGET_MOUNT."
 EOF
+
+# Permanently inject the selected mount point name into the target script
+sed -i "s|REPLACE_WITH_MOUNT|$TARGET_MOUNT|g" "$TARGET_SCRIPT"
 
 # Grant execution permission
 chmod +x "$TARGET_SCRIPT"
